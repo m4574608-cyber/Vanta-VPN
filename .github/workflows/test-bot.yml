@@ -25,9 +25,10 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile main.py
+        run: python -m py_compile main.py db.py admin.py
 
       - name: Run bot for 5 minutes
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
         run: timeout 300 python main.py || [ $? -eq 124 ]
