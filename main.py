@@ -14,6 +14,8 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 import db
+import admin
+
 
 load_dotenv()
 
@@ -136,6 +138,7 @@ async def main():
         raise RuntimeError("BOT_TOKEN не настроен!")
 
     db.init_db()
+    dp.include_router(admin.router)
     bot = Bot(token=TOKEN)
     await dp.start_polling(bot)
 
