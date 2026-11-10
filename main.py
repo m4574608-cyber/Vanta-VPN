@@ -2,10 +2,11 @@ import os
 import asyncio
 import logging
 from pathlib import Path
+from urllib.parse import quote
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandObject, CommandStart
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
@@ -19,6 +20,7 @@ from dotenv import load_dotenv
 
 import admin
 import db
+import tariffs
 import vpn
 
 load_dotenv()
@@ -63,6 +65,16 @@ def media_input(name, caption):
     return InputMediaPhoto(media=media_file(name), caption=caption)
 
 
+def fmt_until(value):
+    return value[:16].replace("T", " ") + " UTC"
+
+
+def parse_referrer(args):
+    if args and args.startswith("ref_") and args[4:].isdigit():
+        return int(args[4:])
+    return None
+
+
 def main_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -72,9 +84,10 @@ def main_menu():
                 InlineKeyboardButton(text="💳 Подписка", callback_data="subscription"),
             ],
             [
+                InlineKeyboardButton(text="👥 Друзья", callback_data="friends"),
                 InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
-                InlineKeyboardButton(text="🆘 Поддержка", callback_data="support"),
             ],
+            [InlineKeyboardButton(text="🆘 Поддержка", callback_data="support")],
         ]
     )
 
@@ -85,6 +98,21 @@ def back_menu():
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
         ]
     )
+
+
+def subscription_menu():
+    rows = []
+    for tariff_id, t in tariffs.TARIFFS.items():
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"💳 {t['title']} — {t['price']}",
+                    callback_data=f"buy_{tariff_id}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def show(callback: CallbackQuery, caption: str, media=BANNER, markup=None):
@@ -100,9 +128,15 @@ async def show(callback: CallbackQuery, caption: str, media=BANNER, markup=None)
 
 
 @dp.message(CommandStart())
-async def start(message: Message):
+async def start(message: Message, command: CommandObject):
     user = message.from_user
-    db.add_user(user.id, user.username, user.full_name)
+
+    referrer_id = parse_referrer(command.args)
+    if referrer_id is not None:
+        if referrer_id == user.id or db.get_user(referrer_id) is None:
+            referrer_id = None
+
+    db.add_user(user.id, user.username, user.full_name, referrer_id)
     sent = await message.answer_photo(
         photo=media_file(BANNER),
         caption=WELCOME_TEXT,
@@ -117,9 +151,29 @@ async def back(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data == "my_vpn")
-async def my_vpn(callback: CallbackQuery):
+async def my_vpn(callback: CallbackQuery, bot: Bot):
     user = callback.from_user
     db.add_user(user.id, user.username, user.full_name)
+
+    referrer_id = db.confirm_referral(user.id)
+    if referrer_id:
+        until = db.claim_referral_reward(
+            referrer_id,
+            tariffs.REF_PER_REWARD,
+            tariffs.REF_REWARD_DAYS,
+            tariffs.REF_COOLDOWN_DAYS,
+        )
+        if until:
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    "🎉 Твои друзья присоединились!\n"
+                    f"Тебе добавлено {tariffs.REF_REWARD_DAYS} дн. доступа "
+                    f"(до {fmt_until(until)}).",
+                )
+            except Exception as e:
+                logging.warning("referrer notify failed: %s", e)
+
     row = db.get_user(user.id)
     await show(callback, vpn.access_text(row), "my_vpn.gif")
 
@@ -135,7 +189,100 @@ async def servers(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "subscription")
 async def subscription(callback: CallbackQuery):
-    await show(callback, "💳 Подписка\n\nСистема тарифов скоро появится.")
+    user = callback.from_user
+    db.add_user(user.id, user.username, user.full_name)
+    row = db.get_user(user.id)
+
+    if vpn.is_active(row):
+        status = "активна до " + fmt_until(row["subscription_until"])
+    else:
+        status = "нет активной подписки"
+
+    await show(
+        callback,
+        "💳 Подписка\n\n"
+        f"Статус: {status}\n\n"
+        "Выбери тариф. Бесплатные дни можно получить за приглашение "
+        "друзей в разделе «👥 Друзья».",
+        markup=subscription_menu(),
+    )
+
+
+@dp.callback_query(F.data.startswith("buy_"))
+async def buy(callback: CallbackQuery):
+    await show(
+        callback,
+        "💳 Оплата скоро появится.\n\n"
+        "Мы сообщим, когда её можно будет подключить.",
+    )
+
+
+@dp.callback_query(F.data == "friends")
+async def friends(callback: CallbackQuery, bot: Bot):
+    user = callback.from_user
+    db.add_user(user.id, user.username, user.full_name)
+
+    me = await bot.me()
+    link = f"https://t.me/{me.username}?start=ref_{user.id}"
+
+    per = tariffs.REF_PER_REWARD
+    days = tariffs.REF_REWARD_DAYS
+    cooldown = tariffs.REF_COOLDOWN_DAYS
+    status = db.referral_status(user.id, per, cooldown)
+
+    text = (
+        "👥 Друзья\n\n"
+        f"За каждых {per} приглашённых друзей ты получаешь +{days} дн. доступа. "
+        f"Награду можно получать раз в {cooldown} дн., отсчёт идёт с момента "
+        "последней награды.\n\n"
+        "Друг засчитывается, когда зайдёт по твоей ссылке и нажмёт «🔑 Мой VPN».\n\n"
+        f"Приглашено: {status['counted']}\n"
+    )
+    if status["need"]:
+        text += f"До награды: ещё {status['need']}\n"
+    if status["wait_days"]:
+        text += f"Следующая награда через {status['wait_days']} дн.\n"
+    if status["can_claim"]:
+        text += "🎁 Награда готова! Нажми кнопку ниже.\n"
+    text += f"\nТвоя ссылка:\n{link}"
+
+    share_url = (
+        "https://t.me/share/url?url=" + quote(link)
+        + "&text=" + quote("Попробуй VANTA VPN")
+    )
+    rows = []
+    if status["can_claim"]:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🎁 Забрать +{days} дн.", callback_data="claim_ref"
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share_url)])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
+
+    await show(callback, text, markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data == "claim_ref")
+async def claim_ref(callback: CallbackQuery):
+    user = callback.from_user
+    db.add_user(user.id, user.username, user.full_name)
+    until = db.claim_referral_reward(
+        user.id,
+        tariffs.REF_PER_REWARD,
+        tariffs.REF_REWARD_DAYS,
+        tariffs.REF_COOLDOWN_DAYS,
+    )
+    if until is None:
+        text = "🎁 Награда пока недоступна."
+    else:
+        text = (
+            f"🎁 Тебе добавлено {tariffs.REF_REWARD_DAYS} дн. доступа!\n"
+            f"Подписка активна до {fmt_until(until)}."
+        )
+    await show(callback, text)
 
 
 @dp.callback_query(F.data == "profile")
