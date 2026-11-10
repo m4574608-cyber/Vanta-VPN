@@ -13,9 +13,9 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
-import db
 import admin
-
+import db
+import vpn
 
 load_dotenv()
 
@@ -80,12 +80,10 @@ async def back(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "my_vpn")
 async def my_vpn(callback: CallbackQuery):
-    await show(
-        callback,
-        "🔑 Твой VPN\n\n"
-        "Пока у тебя нет активной конфигурации.\n"
-        "После подключения VPN-сервера здесь появится твой ключ.",
-    )
+    user = callback.from_user
+    db.add_user(user.id, user.username, user.full_name)
+    row = db.get_user(user.id)
+    await show(callback, vpn.access_text(row))
 
 
 @dp.callback_query(F.data == "servers")
